@@ -110,6 +110,11 @@ public:
         check(error_.load() == kAooOk, "server thread failed");
     }
 
+    void set_request_handler(AooRequestHandler handler, void *user) {
+        check(server_->setRequestHandler(handler, user, 0) == kAooOk,
+              "could not install server request capture");
+    }
+
 private:
     AooServer::Ptr server_;
     std::atomic<bool> running_ { true };
@@ -202,11 +207,24 @@ constexpr int pending_result = std::numeric_limits<int>::min();
 
 struct callback_result {
     std::atomic<int> value { pending_result };
+    AooId group_id = kAooIdInvalid;
+    AooId user_id = kAooIdInvalid;
 };
 
 void store_result(void *user, const AooRequest *, AooError result,
                   const AooResponse *) {
     static_cast<callback_result *>(user)->value.store(result);
+}
+
+void store_join_result(void *user, const AooRequest *, AooError result,
+                       const AooResponse *response) {
+    auto& state = *static_cast<callback_result *>(user);
+    if (result == kAooOk && response) {
+        auto& joined = response->groupJoin;
+        state.group_id = joined.groupId;
+        state.user_id = joined.userId;
+    }
+    state.value.store(result);
 }
 
 void wait_for_result(const callback_result& result, const char *message) {
@@ -217,6 +235,114 @@ void wait_for_result(const callback_result& result, const char *message) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     fail(message);
+}
+
+struct current_join_capture {
+    std::string group_name;
+    std::string group_password;
+    std::string user_name;
+    std::string user_password;
+    std::string group_metadata;
+    std::atomic<bool> seen { false };
+};
+
+AooBool capture_current_join(void *user, AooId, AooId,
+                             const AooRequest *request) {
+    if (request->type != kAooRequestGroupJoin) {
+        return kAooFalse;
+    }
+    auto& state = *static_cast<current_join_capture *>(user);
+    auto& join = request->groupJoin;
+    state.group_name = join.groupName ? join.groupName : "";
+    state.group_password = join.groupPwd ? join.groupPwd : "";
+    state.user_name = join.userName ? join.userName : "";
+    state.user_password = join.userPwd ? join.userPwd : "";
+    if (join.groupMetadata && join.groupMetadata->data) {
+        state.group_metadata.assign((const char *)join.groupMetadata->data,
+                                    join.groupMetadata->size);
+    }
+    state.seen.store(true);
+    return kAooFalse;
+}
+
+void test_current_client_group_join() {
+    auto [primary_port, legacy_port] = unused_tcp_ports();
+    server_runner server(primary_port, legacy_port);
+    current_join_capture captured;
+    server.set_request_handler(capture_current_join, &captured);
+
+    auto client = AooClient::create();
+    check((bool)client, "could not create current client");
+    AooClientSettings settings;
+    settings.portNumber = 0;
+    settings.socketType = kAooSocketIPv4;
+    check(client->setup(settings) == kAooOk, "could not setup current client");
+
+    std::thread send_thread([&]() { client->send(kAooInfinite); });
+    std::thread receive_thread([&]() { client->receive(kAooInfinite); });
+    std::thread run_thread([&]() { client->run(kAooInfinite); });
+
+    AooClientConnect connect;
+    connect.hostName = "127.0.0.1";
+    connect.port = primary_port;
+    connect.timeout = 2.0;
+    callback_result connected;
+    check(client->connect(connect, store_result, &connected) == kAooOk,
+          "could not queue current connection");
+    wait_for_result(connected, "current login timed out");
+    check(connected.value.load() == kAooOk, "current login failed");
+
+    constexpr char metadata_json[] =
+            "{\"type\":\"group\",\"name\":\"fresh-current-group\","
+            "\"isPublic\":false,\"public\":false}";
+    AooData metadata { kAooDataJSON, (const AooByte *)metadata_json,
+                       (AooSize)(sizeof(metadata_json) - 1) };
+    AooClientJoinGroup join;
+    join.groupName = "fresh-current-group";
+    join.groupPassword = "group-secret";
+    join.groupMetadata = &metadata;
+    join.userName = "fresh-current-user";
+    join.userPassword = "user-secret";
+
+    callback_result joined;
+    check(client->joinGroup(join, store_join_result, &joined) == kAooOk,
+          "could not queue current group join");
+    wait_for_result(joined, "current group join timed out");
+    check(joined.value.load() == kAooOk, "current group join failed");
+    check(joined.group_id != kAooIdInvalid, "current join returned no group ID");
+    check(joined.user_id != kAooIdInvalid, "current join returned no user ID");
+
+    check(captured.seen.load(), "server did not receive current group join");
+    check(captured.group_name == "fresh-current-group",
+          "server received wrong current group name");
+    check(captured.group_password == encrypt("group-secret"),
+          "server received wrong current group password hash");
+    check(captured.user_name == "fresh-current-user",
+          "server received wrong current user name");
+    check(captured.user_password == encrypt("user-secret"),
+          "server received wrong current user password hash");
+    check(captured.group_metadata == metadata_json,
+          "server received wrong current group metadata");
+
+    std::cout << "current join request: group=" << captured.group_name
+              << " groupPwd=" << captured.group_password
+              << " user=" << captured.user_name
+              << " userPwd=" << captured.user_password
+              << " metadata=" << captured.group_metadata << '\n'
+              << "current join response: result=" << joined.value.load()
+              << " groupId=" << joined.group_id
+              << " userId=" << joined.user_id << std::endl;
+
+    callback_result disconnected;
+    check(client->disconnect(store_result, &disconnected) == kAooOk,
+          "could not queue current disconnect");
+    wait_for_result(disconnected, "current disconnect timed out");
+    check(disconnected.value.load() == kAooOk, "current disconnect failed");
+
+    client->stop();
+    send_thread.join();
+    receive_thread.join();
+    run_thread.join();
 }
 
 void test_cancel_pending_connection() {
@@ -599,6 +725,7 @@ int main() {
     check(aoo_initialize(nullptr) == kAooOk, "could not initialize AOO");
     test_legacy_peer_matching();
     test_cancel_pending_connection();
+    test_current_client_group_join();
     test_dual_protocol_server();
     test_force_legacy_fallback();
     test_legacy_cannot_bypass_server_password();
