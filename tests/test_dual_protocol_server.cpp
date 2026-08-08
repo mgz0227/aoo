@@ -218,8 +218,8 @@ void test_dual_protocol_server() {
     auto [primary_port, legacy_port] = unused_tcp_ports();
 
     server_runner server(primary_port, legacy_port);
-    udp_socket legacy_udp(port_tag{}, 0);
-    udp_socket current_udp(port_tag{}, 0);
+    udp_socket legacy_udp(ip_address(0, ip_address::IPv4));
+    udp_socket current_udp(ip_address(0, ip_address::IPv4));
     ip_address primary("127.0.0.1", primary_port, ip_address::IPv4);
     ip_address legacy("127.0.0.1", legacy_port, ip_address::IPv4);
 
